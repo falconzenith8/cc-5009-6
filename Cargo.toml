@@ -1,0 +1,33 @@
+[package]
+name = "stage-vol"
+version = "0.1.0"
+edition = "2021"
+description = "Stage volumetric lighting previewer: bounded-step volumetric integration over a procedural stage"
+
+[lib]
+name = "stage_vol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stage-vol-render"
+path = "src/bin/stage_vol_render.rs"
+
+[[bin]]
+name = "stage-vol-ui"
+path = "src/bin/stage_vol_ui.rs"
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = "0.37"
+egui-wgpu = "0.37"
+
+[profile.release]
+opt-level = 3
