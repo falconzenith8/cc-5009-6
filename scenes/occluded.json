@@ -1,6 +1,8 @@
 {
   "fog_sigma": 0.09,
   "steps": 64,
+  "step_error_tolerance": 0.002,
+  "skip_empty_regions": true,
   "view_mode": "Composite",
   "lights": [
     {

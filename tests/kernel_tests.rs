@@ -142,3 +142,96 @@ fn gpu_device_recovery_when_adapter_available() {
     let after = gpu.render(&p, 0.0).unwrap();
     assert_eq!(before.rgba, after.rgba, "恢复后帧不一致");
 }
+
+// --- empty-region skip: execution evidence and conservative behavior ------
+
+#[test]
+fn skip_path_reports_real_execution_evidence() {
+    use stage_vol::cpu::CpuRenderer;
+    use stage_vol::kernel::cost::CostBreakdown;
+    let mut p = StageVolParams::default();
+    p.view_mode = ViewMode::VolumeOnly;
+    let (_, skip) = CpuRenderer::new(160, 90).render_with_stats(&p, 0.0);
+    let (_, uniform) = CpuRenderer::new(160, 90).render_reference(&p, 0.0);
+    // Evidence is real, not default/zeroed.
+    assert!(skip.has_execution_evidence(), "skip stats: {skip:?}");
+    assert!(uniform.has_execution_evidence(), "uniform stats: {uniform:?}");
+    assert_eq!(skip.rays, (160 * 90) as u64);
+    assert_eq!(uniform.rays, skip.rays);
+    // Skip must actually skip: fewer samples, positive skipped distance.
+    assert!(skip.samples < uniform.samples, "skip={} uniform={}", skip.samples, uniform.samples);
+    assert!(skip.skipped_meters > 0.0);
+    assert!(skip.sample_saving() > 0.5, "saving={}", skip.sample_saving());
+    // Units unchanged: transmittance is unitless, so it stays in (0, 1].
+    assert_eq!(CostBreakdown::default().samples, 0);
+}
+
+#[test]
+fn skip_and_uniform_agree_on_volume_and_transmittance() {
+    let mut p = StageVolParams::default();
+    p.view_mode = ViewMode::VolumeOnly;
+    p.steps = 128;
+    let r = CpuRenderer::new(160, 90);
+    let (a, _) = r.render_with_stats(&p, 0.0);
+    let (b, _) = r.render_reference(&p, 0.0);
+    // Transmittance only depends on the medium, never on the step schedule.
+    // The skip path groups the same exponential into spans+gaps instead of one
+    // contiguous product, so f32 associativity leaves a last-bits difference
+    // (~1e-6 at 128 steps); anything larger would mean a unit/medium change.
+    let max_dt = a
+        .transmittance
+        .iter()
+        .zip(&b.transmittance)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_dt < 1e-5, "transmittance drifted: {max_dt}");
+    // Volume radiance agrees within the error bound (relative to the mean).
+    let ma = a.mean_volume_luminance();
+    let mb = b.mean_volume_luminance();
+    let rel = (ma - mb).abs() / ma.max(1e-9);
+    assert!(rel < 0.02, "skip vs uniform volume drift {rel}: {ma} vs {mb}");
+}
+
+#[test]
+fn summary_invalidates_when_medium_or_light_changes() {
+    use stage_vol::kernel::summary::SummaryCache;
+    let mut p = StageVolParams::default();
+    let mut cache = SummaryCache::default();
+    cache.get(&p, 0.0);
+    assert_eq!(cache.rebuilds, 1);
+    cache.get(&p, 0.0);
+    assert_eq!(cache.reuses, 1);
+    p.fog_sigma = 0.3;
+    assert!(!cache.is_valid_for(&p, 0.0), "σ change must invalidate");
+    cache.get(&p, 0.0);
+    assert_eq!(cache.rebuilds, 2);
+    p.lights[0].range = 15.0;
+    assert!(!cache.is_valid_for(&p, 0.0), "light change must invalidate");
+    p.occluder_x = 1.0;
+    cache.get(&p, 0.0);
+    assert_eq!(cache.rebuilds, 3);
+}
+
+#[test]
+fn benchmark_rejects_reports_without_evidence() {
+    use stage_vol::kernel::bench::{validate_benchmark, BenchmarkReport};
+    let empty = BenchmarkReport {
+        backend: "test".into(),
+        width: 0,
+        height: 0,
+        levels: vec![],
+        notes: vec![],
+    };
+    assert!(validate_benchmark(&empty, 0.05, 0.005).is_err(), "空基准必须失败");
+}
+
+#[test]
+fn benchmark_passes_and_reports_speed_with_real_execution() {
+    use stage_vol::kernel::bench::{run_benchmark, validate_benchmark};
+    // Small frame keeps the test fast; the benchmark still runs the full
+    // skip path on every pixel.
+    let report = run_benchmark(96, 54, "test-cpu");
+    assert!(report.all_levels_have_evidence(), "缺少执行证据: {report:?}");
+    validate_benchmark(&report, 0.05, 0.02).expect("基准应在容差内通过");
+    assert!(report.speed_reported());
+}

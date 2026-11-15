@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use stage_vol::cpu::{CpuRenderer, Frame};
 use stage_vol::gpu::GpuRenderer;
+use stage_vol::kernel::bench::{run_benchmark, validate_benchmark};
 use stage_vol::kernel::params::{StageVolParams, ViewMode, MAX_STEPS};
 use stage_vol::kernel::report::{CheckResult, FrameTimer, FrameTiming, Report, SceneReport};
 
@@ -79,6 +80,16 @@ enum Cmd {
     SaveScenes,
     /// Print the model boundary statement.
     ModelNotes,
+    /// Beam cost benchmark: uniform reference vs empty-region skipping,
+    /// staged from full frame through sparse beam to a density discontinuity.
+    Bench {
+        /// Error tolerance for the benchmark gate (relative luminance).
+        #[arg(long, default_value = "0.02")]
+        max_error: f64,
+        /// Write the benchmark report here.
+        #[arg(long, default_value = "out/bench.json")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -534,6 +545,73 @@ fn main() -> Result<()> {
         }
         Cmd::RecoverTest => {
             run_recover_test(cli.backend, cli.width, cli.height, &cli.out)?;
+        }
+        Cmd::Bench { max_error, output } => {
+            let report = run_benchmark(cli.width, cli.height, "cpu-reference");
+            // The benchmark measures the CPU kernel directly; the GPU path
+            // shares the same bounds but is validated separately by `test`.
+            const REGRESSION_MARGIN: f64 = 0.005;
+            if let Err(e) = validate_benchmark(&report, *max_error, REGRESSION_MARGIN) {
+                let _ = std::fs::write(
+                    output,
+                    serde_json::to_string_pretty(&report).unwrap_or_default(),
+                );
+                anyhow::bail!("光束成本基准未通过: {e}");
+            }
+            if !report.speed_reported() {
+                anyhow::bail!("光束成本基准缺少实际执行证据，拒绝报告速度");
+            }
+            println!(
+                "=== 光束成本基准 (backend={}, {}x{}) ===",
+                report.backend, report.width, report.height
+            );
+            for l in &report.levels {
+                println!(
+                    "档位 {:<13} N={:<4} σ={:<5} 受光像素 {}/{}",
+                    l.level.label(),
+                    l.steps,
+                    l.fog_sigma,
+                    l.lit_pixels,
+                    l.total_pixels
+                );
+                println!(
+                    "  样本: 实际 {} / 基准 {} (节省 {:.1}%)；跳过距离 {:.1}%；空区样本 {:.1}%；高密度样本 {:.1}%",
+                    l.skip_cost.samples,
+                    l.skip_cost.baseline_samples,
+                    l.skip_cost.sample_saving() * 100.0,
+                    l.skip_cost.skipped_fraction() * 100.0,
+                    l.skip_cost.empty_fraction() * 100.0,
+                    l.skip_cost.high_density_fraction() * 100.0
+                );
+                println!(
+                    "  亮度误差(对收敛参照): 跳过 平均 {:.3e} 最大 {:.3e} 相对 {:.4}；同预算均匀 平均 {:.3e} 相对 {:.4}",
+                    l.skip_error_vs_truth_mean,
+                    l.skip_error_vs_truth_max,
+                    l.relative_skip_error,
+                    l.reference_error_vs_truth_mean,
+                    l.relative_reference_error
+                );
+                println!(
+                    "  透过率差 {:.3e}；耗时 跳过 {:.1} ms vs 同预算均匀 {:.1} ms（{:.2}×），收敛参照 {:.1} ms",
+                    l.mean_transmittance_delta, l.skip_ms, l.reference_ms, l.speedup, l.truth_ms
+                );
+                println!(
+                    "  证据: rays={} baseline_samples={} samples={} spans={} occlusion_queries={} transmittance_updates={} error_bound_violations={}",
+                    l.skip_cost.rays,
+                    l.skip_cost.baseline_samples,
+                    l.skip_cost.samples,
+                    l.skip_cost.spans,
+                    l.skip_cost.occlusion_queries,
+                    l.skip_cost.transmittance_updates,
+                    l.skip_cost.error_bound_violations
+                );
+            }
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(dir) = output.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(output, json)?;
+            println!("基准报告 → {}", output.display());
         }
     }
     Ok(())

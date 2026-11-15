@@ -7,6 +7,8 @@ struct Light {
     direction_cos_outer: vec4f, // xyz: beam direction, w: cos(outer)
     source_cos_inner: vec4f,    // rgb: color*intensity, w: cos(inner)
     gobo: vec4f,                // x: gobo id, y: gobo scale, z: enabled
+    bound_apex_range: vec4f,    // xyz: light position, w: range
+    bound_axis_cos: vec4f,      // xyz: beam axis, w: cos(outer)
 };
 
 struct Params {
@@ -20,7 +22,7 @@ struct Params {
     max_distance: f32,          // m, hard bound for the integral
     screen: vec2f,
     time: f32,
-    pad: f32,
+    skip_empty: u32,            // 1 = conservative empty-region skip
 };
 
 const MIN_LIGHT_DIST: f32 = 0.05;

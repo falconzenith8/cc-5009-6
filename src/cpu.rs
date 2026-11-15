@@ -3,12 +3,15 @@
 //! intersection and occlusion. Used by tests, reference high-sample frames,
 //! and as the fallback backend when no GPU adapter is available.
 
+use crate::kernel::cost::CostBreakdown;
 use crate::kernel::integrate::{
-    in_scatter, integrate_volume, shade_surface, Camera, PreparedLight,
+    in_scatter_counted, integrate_spans, shade_surface, Camera, PreparedLight,
 };
 use crate::kernel::math::Vec3;
 use crate::kernel::params::{StageVolParams, ViewMode, MAX_RAY_DISTANCE};
 use crate::kernel::scene::Scene;
+use crate::kernel::summary::SummaryCache;
+use crate::kernel::cost::DEFAULT_HIGH_DENSITY_THRESHOLD;
 
 pub struct Frame {
     pub width: u32,
@@ -69,15 +72,48 @@ impl CpuRenderer {
     }
 
     pub fn render(&self, params: &StageVolParams, time: f32) -> Frame {
+        self.render_with_stats(params, time).0
+    }
+
+    /// Render with cost evidence. `skip_empty_regions` selects between the
+    /// uniform reference integrator (`integrate_volume`, unchanged from the
+    /// pre-skip build) and the conservative empty-region skip
+    /// (`integrate_spans`). Both share meter units and the same shadow query,
+    /// so the second return value is a like-for-like comparison source.
+    pub fn render_with_stats(
+        &self,
+        params: &StageVolParams,
+        time: f32,
+    ) -> (Frame, CostBreakdown) {
+        self.render_inner(params, time, true)
+    }
+
+    /// Uniform reference integrator without empty-region skipping. This is
+    /// the execution baseline the benchmark compares against.
+    pub fn render_reference(&self, params: &StageVolParams, time: f32) -> (Frame, CostBreakdown) {
+        self.render_inner(params, time, false)
+    }
+
+    fn render_inner(
+        &self,
+        params: &StageVolParams,
+        time: f32,
+        skip_empty_regions: bool,
+    ) -> (Frame, CostBreakdown) {
         let (w, h) = (self.width, self.height);
         let scene = Scene::build(params.occluder_x_at(time), params.occluder_visible, params.occluder_scale);
         let lights: Vec<PreparedLight> = params.lights.iter().map(PreparedLight::prepare).collect();
         let cam = Camera::from_params(params, w as f32 / h.max(1) as f32);
 
+        let mut summary_cache = SummaryCache::default();
+        let summary = summary_cache.get(params, time);
+
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         let mut volume = vec![[0.0f32; 3]; (w * h) as usize];
         let mut transmittance = vec![1.0f32; (w * h) as usize];
         let mut surface_shadow = vec![1.0f32; (w * h) as usize];
+        let mut stats = CostBreakdown::default();
+        let mut source = |p: Vec3| in_scatter_counted(&scene, &lights, p, DEFAULT_HIGH_DENSITY_THRESHOLD);
 
         for py in 0..h {
             for px in 0..w {
@@ -86,9 +122,32 @@ impl CpuRenderer {
                 let hit = scene.intersect(&ray, MAX_RAY_DISTANCE);
                 let t_surface = hit.map(|(t, _, _)| t).unwrap_or(MAX_RAY_DISTANCE);
 
-                let (l, tr) = integrate_volume(&ray, t_surface, params.fog_sigma, params.steps, |p| {
-                    in_scatter(&scene, &lights, p)
-                });
+                let (l, tr, ray_stats) = if skip_empty_regions {
+                    let spans = summary.spans(&ray, t_surface);
+                    integrate_spans(
+                        &ray,
+                        t_surface,
+                        params.fog_sigma,
+                        params.steps,
+                        params.step_error_tolerance,
+                        &mut source,
+                        spans.spans(),
+                    )
+                } else {
+                    // Reference path: same update, whole ray as one span, so
+                    // the step schedule matches `integrate_volume` bit for bit.
+                    let whole = [(0.0f32, t_surface)];
+                    integrate_spans(
+                        &ray,
+                        t_surface,
+                        params.fog_sigma,
+                        params.steps,
+                        1.0,
+                        &mut source,
+                        &whole,
+                    )
+                };
+                stats.merge(&ray_stats);
                 volume[idx] = [l.x, l.y, l.z];
                 transmittance[idx] = tr;
 
@@ -132,7 +191,7 @@ impl CpuRenderer {
                 rgba[idx * 4 + 3] = 255;
             }
         }
-        Frame { width: w, height: h, rgba, volume, transmittance, surface_shadow }
+        (Frame { width: w, height: h, rgba, volume, transmittance, surface_shadow }, stats)
     }
 }
 

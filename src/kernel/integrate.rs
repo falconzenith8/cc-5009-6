@@ -12,10 +12,12 @@
 //! - all distances in meters, σ in 1/m, every ray is clamped to
 //!   [`MAX_RAY_DISTANCE`] so the integral is always bounded.
 
+use super::cost::CostBreakdown;
 use super::gobo::gobo;
 use super::math::{smoothstep, Mat4, Ray, Vec3};
 use super::params::{SpotLight, StageVolParams, MAX_RAY_DISTANCE};
 use super::scene::Scene;
+use super::summary::MAX_LIT_SPANS;
 use bytemuck::{Pod, Zeroable};
 
 /// Minimum distance used in the 1/d² falloff so a sample exactly at the
@@ -23,6 +25,10 @@ use bytemuck::{Pod, Zeroable};
 const MIN_LIGHT_DIST: f32 = 0.05;
 /// Shadow ray trim at both ends, meters.
 const SHADOW_EPS: f32 = 0.02;
+/// Fraction of a lit span spent per step when the user step count is sparse.
+const MIN_STEPS_PER_LIT_SPAN: f32 = 2.0;
+/// Upper bound on steps one ray may run, even when several spans are lit.
+const MAX_SPAN_STEPS: u32 = 2048;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedLight {
@@ -116,13 +122,44 @@ where
     light.source * (cone * atten * range_gate * g)
 }
 
+/// One source-term evaluation plus its classification and shadow-query count.
+/// Produced by [`in_scatter_counted`] so the integrator counters reflect the
+/// actual work of the same evaluation that fed the radiance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SampleEval {
+    pub value: Vec3,
+    pub empty: bool,
+    pub high_density: bool,
+    pub occlusion_queries: u32,
+}
+
 /// In-scatter source S(p) summed over all lights (CPU shadow query).
 pub fn in_scatter(scene: &Scene, lights: &[PreparedLight], p: Vec3) -> Vec3 {
+    in_scatter_counted(scene, lights, p, f32::INFINITY).value
+}
+
+pub(crate) fn in_scatter_counted(
+    scene: &Scene,
+    lights: &[PreparedLight],
+    p: Vec3,
+    high_threshold: f32,
+) -> SampleEval {
+    let queries = core::cell::Cell::new(0u32);
     let mut s = Vec3::ZERO;
     for l in lights {
-        s += light_term(l, p, |p0, dir, max_t| scene.occluded(p0, dir, max_t));
+        s += light_term(l, p, |p0, dir, max_t| {
+            queries.set(queries.get() + 1);
+            scene.occluded(p0, dir, max_t)
+        });
     }
-    s
+    let non_zero = s.x != 0.0 || s.y != 0.0 || s.z != 0.0;
+    let lum = (s.x + s.y + s.z) / 3.0;
+    SampleEval {
+        value: s,
+        empty: !non_zero,
+        high_density: lum >= high_threshold,
+        occlusion_queries: queries.get(),
+    }
 }
 
 /// Bounded-step volume integration along `ray` from the camera to the first
@@ -133,6 +170,9 @@ pub fn in_scatter(scene: &Scene, lights: &[PreparedLight], p: Vec3) -> Vec3 {
 /// over the segment, so results converge as `steps` grows instead of scaling
 /// with it. `steps` is clamped to [1, 512]; distance is clamped to
 /// [`MAX_RAY_DISTANCE`]. All outputs are finite for finite inputs.
+///
+/// This uniform entry point keeps the converged per-ray schedule: one span
+/// covering the ray, no error-driven refinement.
 pub fn integrate_volume<F>(
     ray: &Ray,
     t_surface: f32,
@@ -143,28 +183,201 @@ pub fn integrate_volume<F>(
 where
     F: FnMut(Vec3) -> Vec3,
 {
-    let t0 = 0.0f32;
+    let full = [(0.0f32, MAX_RAY_DISTANCE)];
+    let mut counted = |p: Vec3| {
+        SampleEval { value: source(p), ..Default::default() }
+    };
+    let (l, t, _) = integrate_spans(ray, t_surface, sigma, steps, 1.0, &mut counted, &full);
+    (l, t)
+}
+
+/// Empty-region-skipping integrator.
+///
+/// `spans` are the conservative lit intervals for this ray (see
+/// [`InfluenceSummary::spans`]); the complement is skipped with an exact
+/// transmittance update and no source evaluation. Steps are distributed only
+/// over lit spans, with a per-span floor so sparse beam pixels are not
+/// under-sampled relative to the uniform integrator. `steps` keeps its meaning
+/// as the budget for the *whole ray*: a ray with no lit span runs zero steps,
+/// and a ray whose spans cover the ray matches [`integrate_volume`].
+///
+/// `stats` records execution evidence (samples, skipped distance, empty and
+/// high-density counts). Empty/high-density classification comes from the
+/// single `source` evaluation, so counters do not double the shadow-query
+/// cost.
+pub fn integrate_spans<F>(
+    ray: &Ray,
+    t_surface: f32,
+    sigma: f32,
+    steps: u32,
+    error_tolerance: f32,
+    source: &mut F,
+    spans: &[(f32, f32)],
+) -> (Vec3, f32, CostBreakdown)
+where
+    F: FnMut(Vec3) -> SampleEval,
+{
     let t1 = t_surface.min(MAX_RAY_DISTANCE);
-    let len = t1 - t0;
-    if !len.is_finite() || len <= 0.0 {
-        return (Vec3::ZERO, 1.0);
+    let mut stats = CostBreakdown {
+        rays: 1,
+        baseline_samples: steps.clamp(1, super::params::MAX_STEPS) as u64,
+        ..Default::default()
+    };
+    if !(t1 > 0.0) || !t1.is_finite() {
+        return (Vec3::ZERO, 1.0, stats);
     }
-    let n = steps.clamp(1, super::params::MAX_STEPS);
-    let dt = len / n as f32;
     let sigma = sigma.max(0.0);
-    let tr_seg = (-sigma * dt).exp();
+    let tr = |dt: f32| (-sigma * dt).exp();
+
+    let mut lit: [(f32, f32); MAX_LIT_SPANS] = [(0.0, 0.0); MAX_LIT_SPANS];
+    let mut n_lit = 0usize;
+    for &(a, b) in spans {
+        let (a, b) = (a.max(0.0), b.min(t1));
+        if b > a {
+            if n_lit == MAX_LIT_SPANS {
+                // More spans than the summary can produce; be conservative and
+                // cover the whole ray instead of dropping one.
+                lit[0] = (0.0, t1);
+                n_lit = 1;
+                break;
+            }
+            lit[n_lit] = (a, b);
+            n_lit += 1;
+        }
+    }
+    let lit = &mut lit[..n_lit];
+    // Summary spans arrive sorted, but insertion sort keeps the exact
+    // merge semantics if a caller passes overlapping/unsorted spans.
+    for i in 1..lit.len() {
+        let key = lit[i];
+        let mut j = i;
+        while j > 0 && lit[j - 1].0 > key.0 {
+            lit[j] = lit[j - 1];
+            j -= 1;
+        }
+        lit[j] = key;
+    }
+    let mut merged: [(f32, f32); MAX_LIT_SPANS] = [(0.0, 0.0); MAX_LIT_SPANS];
+    let mut n_merged = 0usize;
+    for &(lo, hi) in lit.iter() {
+        if n_merged > 0 && lo <= merged[n_merged - 1].1 + 1e-5 {
+            merged[n_merged - 1].1 = merged[n_merged - 1].1.max(hi);
+        } else {
+            merged[n_merged] = (lo, hi);
+            n_merged += 1;
+        }
+    }
+    let merged = &merged[..n_merged];
+
     let mut l = Vec3::ZERO;
     let mut t_acc = 1.0f32;
-    for i in 0..n {
-        let t = t0 + (i as f32 + 0.5) * dt;
-        let s = source(ray.at(t));
-        if s.is_finite() {
-            l += s * (t_acc * (1.0 - tr_seg));
+    let mut cursor = 0.0f32;
+
+    // Advance transmittance across an unlit gap exactly; no source sample.
+    let skip_to = |from: f32, to: f32, t_acc: &mut f32, stats: &mut CostBreakdown| {
+        if to > from {
+            *t_acc *= tr(to - from);
+            stats.skipped_meters += (to - from) as f64;
+            stats.transmittance_updates += 1;
         }
-        t_acc *= tr_seg;
+    };
+
+    for &(a, b) in merged.iter() {
+        let a = a.max(cursor);
+        if b <= a {
+            continue;
+        }
+        skip_to(cursor, a, &mut t_acc, &mut stats);
+        let width = b - a;
+        // Tolerance >= 1 is the uniform-reference marker: no error refinement
+        // and no per-span floor, so the reference reproduces the original
+        // whole-ray uniform schedule exactly at the user step budget.
+        let (requested, floor) = if error_tolerance < 1.0 {
+            (error_bound_steps(width, sigma, error_tolerance), MIN_STEPS_PER_LIT_SPAN)
+        } else {
+            (0, 0.0)
+        };
+        let n = span_steps(width, steps, merged.len(), requested, floor, &mut stats);
+        let dt = width / n as f32;
+        let tr_seg = tr(dt);
+        for i in 0..n {
+            let t = a + (i as f32 + 0.5) * dt;
+            let e = source(ray.at(t));
+            stats.samples += 1;
+            stats.occlusion_queries += e.occlusion_queries as u64;
+            if i == 0 {
+                stats.spans += 1;
+            }
+            if e.empty {
+                stats.empty_samples += 1;
+            }
+            if e.high_density {
+                stats.high_density_samples += 1;
+            }
+            if e.value.is_finite() {
+                l += e.value * (t_acc * (1.0 - tr_seg));
+            }
+            t_acc *= tr_seg;
+            stats.transmittance_updates += 1;
+        }
+        stats.integrated_meters += width as f64;
+        cursor = b;
     }
+    skip_to(cursor, t1, &mut t_acc, &mut stats);
+
     debug_assert!(l.is_finite() && t_acc.is_finite());
-    (l, t_acc)
+    (l, t_acc, stats)
+}
+
+/// Step count for one lit span. Three constraints combine:
+/// * the user `steps` is the budget for the whole ray; with `n_spans` disjoint
+///   lit intervals each gets `steps / n_spans` as a floor so the per-ray total
+///   cannot exceed the user budget by more than the span floors,
+/// * thin beams get at least `min_steps_per_span` samples (0 for the uniform
+///   reference, which must keep the original whole-ray schedule),
+/// * the error bound `requested` may raise the count, so a changed medium or
+///   light state cannot silently reuse a too-coarse schedule.
+/// [`MAX_SPAN_STEPS`] caps the result.
+fn span_steps(
+    width: f32,
+    steps: u32,
+    n_spans: usize,
+    requested: u32,
+    min_steps_per_span: f32,
+    stats: &mut CostBreakdown,
+) -> u32 {
+    if !(width > 0.0) {
+        return 0;
+    }
+    let budget = steps.clamp(1, super::params::MAX_STEPS);
+    let share = (budget as f32 / n_spans.max(1) as f32).max(min_steps_per_span);
+    let mut n = (share.ceil() as u32).max(requested);
+    if n > MAX_SPAN_STEPS {
+        n = MAX_SPAN_STEPS;
+        stats.error_bound_violations += 1;
+    }
+    n.clamp(1, MAX_SPAN_STEPS)
+}
+
+/// Error-constrained step request for a ray of length `len` through a medium
+/// with extinction `sigma`. The bound treats the source term as constant per
+/// step and requires the exponential-segment error `S·(σΔt)²/2` to stay below
+/// `tol`. Uses the worst-case `S = 1` and returns the requested uniform step
+/// count. Not used as a silent default: callers compare it against the user
+/// budget and report whether the budget was sufficient.
+pub fn error_bound_steps(len: f32, sigma: f32, tol: f32) -> u32 {
+    if !(len > 0.0) || !len.is_finite() {
+        return 1;
+    }
+    let sigma = sigma.max(0.0);
+    if sigma <= 0.0 || !(tol > 0.0) {
+        return 1;
+    }
+    let dt_max = (2.0 * tol / (sigma * sigma)).sqrt();
+    if !(dt_max > 0.0) || !dt_max.is_finite() {
+        return super::params::MAX_STEPS;
+    }
+    ((len / dt_max).ceil() as u32).clamp(1, super::params::MAX_STEPS)
 }
 
 /// Lambert-ish opaque shading so the composite view is coherent with the
@@ -264,6 +477,11 @@ pub struct GpuLight {
     pub direction_cos_outer: [f32; 4],
     pub source_cos_inner: [f32; 4],
     pub gobo: [f32; 4], // id, scale, enabled, pad
+    /// xyz = light position (beam apex), w = range. Mirrors
+    /// `kernel::summary::LightBound` for the conservative skip.
+    pub bound_apex_range: [f32; 4],
+    /// xyz = normalized beam axis, w = cos(outer cone half-angle).
+    pub bound_axis_cos: [f32; 4],
 }
 
 #[repr(C)]
@@ -279,12 +497,14 @@ pub struct GpuParams {
     pub max_distance: f32,
     pub screen: [f32; 2],
     pub time: f32,
-    pub _pad: f32,
+    /// 1 = conservative empty-region skip, 0 = uniform reference schedule.
+    pub skip_empty: u32,
 }
 
 impl GpuParams {
-    pub fn build(params: &StageVolParams, width: u32, height: u32, time: f32) -> GpuParams {
-        let aspect = width as f32 / height.max(1) as f32;
+    /// GPU uniform mirror; `error_tolerance` travels only with the CPU
+    /// skip path (the shader keeps the uniform schedule).
+    pub fn build(params: &StageVolParams, width: u32, height: u32, time: f32) -> GpuParams {        let aspect = width as f32 / height.max(1) as f32;
         let cam = Camera::from_params(params, aspect);
         let mut lights = [GpuLight {
             view_proj: [[0.0; 4]; 4],
@@ -292,6 +512,8 @@ impl GpuParams {
             direction_cos_outer: [0.0; 4],
             source_cos_inner: [0.0; 4],
             gobo: [0.0; 4],
+            bound_apex_range: [0.0; 4],
+            bound_axis_cos: [0.0; 4],
         }; super::params::MAX_LIGHTS];
         for (i, l) in params.lights.iter().take(super::params::MAX_LIGHTS).enumerate() {
             let p = PreparedLight::prepare(l);
@@ -301,6 +523,18 @@ impl GpuParams {
                 direction_cos_outer: [p.direction.x, p.direction.y, p.direction.z, p.cos_outer],
                 source_cos_inner: [p.source.x, p.source.y, p.source.z, p.cos_inner],
                 gobo: [p.gobo_id as f32, p.gobo_scale, if p.enabled { 1.0 } else { 0.0 }, 0.0],
+                // The conservative bound ignores gobo/occlusion and only keeps
+                // cone + range, matching `InfluenceSummary`.
+                bound_apex_range: if p.enabled {
+                    [p.position.x, p.position.y, p.position.z, p.range]
+                } else {
+                    [0.0; 4]
+                },
+                bound_axis_cos: if p.enabled {
+                    [p.direction.x, p.direction.y, p.direction.z, p.cos_outer]
+                } else {
+                    [0.0, 0.0, 0.0, 2.0] // cos_outer > 1 => empty cone
+                },
             };
         }
         GpuParams {
@@ -314,7 +548,7 @@ impl GpuParams {
             max_distance: MAX_RAY_DISTANCE,
             screen: [width as f32, height as f32],
             time,
-            _pad: 0.0,
+            skip_empty: if params.skip_empty_regions { 1 } else { 0 },
         }
     }
 }
@@ -373,6 +607,52 @@ mod tests {
         let ray2 = Ray { origin: Vec3::new(0.0, 0.01, 1.0), dir: Vec3::new(0.0, 0.0, -1.0) };
         let (l2, t2) = integrate_volume(&ray2, 0.5, params.fog_sigma, 128, |p| in_scatter(&scene, &lights, p));
         assert!(l2.is_finite() && t2.is_finite());
+    }
+
+    #[test]
+    fn reference_path_matches_original_uniform_schedule() {
+        // The uniform reference must reproduce the pre-skip whole-ray schedule
+        // exactly, including at tiny step budgets where the skip path's
+        // per-span floor and error bound would otherwise change the count.
+        let (scene, lights, params) = default_setup();
+        let cam = Camera::from_params(&params, 1.0);
+        let ray = cam.ray(50.0, 42.0, 100.0, 80.0);
+        let t_surface = scene
+            .intersect(&ray, MAX_RAY_DISTANCE)
+            .map(|h| h.0)
+            .unwrap_or(MAX_RAY_DISTANCE);
+        let sigma = params.fog_sigma;
+        for &n in &[1u32, 2, 8, 64, 256] {
+            // Original loop, kept here as the independent oracle.
+            let mut l0 = Vec3::ZERO;
+            let mut t0 = 1.0f32;
+            let len = t_surface;
+            let dt = len / n as f32;
+            let tr_seg = (-sigma * dt).exp();
+            for i in 0..n {
+                let t = (i as f32 + 0.5) * dt;
+                let s = in_scatter(&scene, &lights, ray.at(t));
+                l0 += s * (t0 * (1.0 - tr_seg));
+                t0 *= tr_seg;
+            }
+            let (l1, t1) = integrate_volume(&ray, t_surface, sigma, n, |p| {
+                in_scatter(&scene, &lights, p)
+            });
+            let (l2, t2, _) = integrate_spans(
+                &ray,
+                t_surface,
+                sigma,
+                n,
+                1.0,
+                &mut |p| SampleEval { value: in_scatter(&scene, &lights, p), ..Default::default() },
+                &[(0.0, t_surface)],
+            );
+            // Same number of samples and the same recurrence: exact match.
+            assert_eq!(l1, l0, "integrate_volume drifted at n={n}");
+            assert_eq!(t1, t0);
+            assert_eq!(l2, l0, "reference path drifted at n={n}");
+            assert_eq!(t2, t0);
+        }
     }
 
     #[test]

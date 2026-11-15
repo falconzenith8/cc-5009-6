@@ -12,6 +12,19 @@ pub const MAX_LIGHTS: usize = 2;
 /// Hard bound on any integration distance, meters. Keeps the integral
 /// bounded even when a ray never hits geometry.
 pub const MAX_RAY_DISTANCE: f32 = 40.0;
+/// Default radiance error tolerance for the per-span step bound. A step is
+/// accepted when the constant-source segment error `S·(σΔt)²/2` stays below
+/// this value; spans may therefore use more than `steps` samples, up to the
+/// integrator's hard cap.
+pub const DEFAULT_STEP_ERROR_TOLERANCE: f32 = 2.0e-3;
+
+fn default_step_error_tolerance() -> f32 {
+    DEFAULT_STEP_ERROR_TOLERANCE
+}
+
+fn default_skip_empty_regions() -> bool {
+    true
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewMode {
@@ -92,6 +105,16 @@ pub struct StageVolParams {
     /// Bounded raymarch step count; the integral converges as steps grow,
     /// it does not simply get brighter (per-segment exponential integrator).
     pub steps: u32,
+    /// Radiance tolerance for the error-constrained per-span step bound.
+    /// The bound can raise a span above `steps` (up to the hard cap) so
+    /// changing light/medium state cannot leak a stale step schedule.
+    #[serde(default = "default_step_error_tolerance")]
+    pub step_error_tolerance: f32,
+    /// Skip the conservative empty regions of the beam (CPU and GPU paths).
+    /// Off reproduces the uniform reference schedule; the benchmark and the
+    /// UI toggle both paths so the comparison is like-for-like.
+    #[serde(default = "default_skip_empty_regions")]
+    pub skip_empty_regions: bool,
     pub view_mode: ViewMode,
     pub lights: Vec<SpotLight>,
     /// Occluder panel horizontal offset, meters.
@@ -119,6 +142,8 @@ impl Default for StageVolParams {
         StageVolParams {
             fog_sigma: 0.09,
             steps: 64,
+            step_error_tolerance: DEFAULT_STEP_ERROR_TOLERANCE,
+            skip_empty_regions: true,
             view_mode: ViewMode::Composite,
             lights,
             occluder_x: 0.0,
@@ -147,6 +172,8 @@ pub fn control_schema() -> Vec<ControlDesc> {
     vec![
         ControlDesc { id: "fog_sigma", label: "雾密度 σ (1/m)", min: 0.0, max: 0.5, step: 0.001 },
         ControlDesc { id: "steps", label: "积分步数 N", min: 1.0, max: MAX_STEPS as f32, step: 1.0 },
+        ControlDesc { id: "step_error_tolerance", label: "步长误差容差", min: 0.0001, max: 0.05, step: 0.0001 },
+        ControlDesc { id: "skip_empty", label: "空区跳过 (0=关, 1=开)", min: 0.0, max: 1.0, step: 1.0 },
         ControlDesc { id: "light0.intensity", label: "灯0 强度", min: 0.0, max: 60.0, step: 0.1 },
         ControlDesc { id: "light0.range", label: "灯0 范围 (m)", min: 1.0, max: 20.0, step: 0.1 },
         ControlDesc { id: "light0.outer_cone_deg", label: "灯0 外锥角 (°)", min: 5.0, max: 45.0, step: 0.5 },
@@ -175,6 +202,14 @@ impl StageVolParams {
         if self.steps == 0 || self.steps > MAX_STEPS {
             issues.push(ValidationIssue { field: "steps", message: format!("步数 {} 超出 [1, {}]", self.steps, MAX_STEPS) });
         }
+        if !(1.0e-6..=1.0).contains(&self.step_error_tolerance)
+            || !self.step_error_tolerance.is_finite()
+        {
+            issues.push(ValidationIssue {
+                field: "step_error_tolerance",
+                message: format!("步长误差容差 {} 超出 [1e-6, 1]", self.step_error_tolerance),
+            });
+        }
         for (i, l) in self.lights.iter().enumerate() {
             if l.outer_cone_deg <= l.inner_cone_deg {
                 issues.push(ValidationIssue { field: "lights", message: format!("灯{i} 外锥角必须大于内锥角") });
@@ -199,6 +234,8 @@ impl StageVolParams {
         match id {
             "fog_sigma" => Some(self.fog_sigma),
             "steps" => Some(self.steps as f32),
+            "step_error_tolerance" => Some(self.step_error_tolerance),
+            "skip_empty" => Some(if self.skip_empty_regions { 1.0 } else { 0.0 }),
             "occluder_x" => Some(self.occluder_x),
             "occluder_scale" => Some(self.occluder_scale),
             "light0.intensity" => self.lights.first().map(|l| l.intensity),
@@ -223,6 +260,8 @@ impl StageVolParams {
         match id {
             "fog_sigma" => next.fog_sigma = value,
             "steps" => next.steps = value.round().max(1.0) as u32,
+            "step_error_tolerance" => next.step_error_tolerance = value,
+            "skip_empty" => next.skip_empty_regions = value >= 0.5,
             "occluder_x" => next.occluder_x = value,
             "occluder_scale" => next.occluder_scale = value,
             "light0.intensity" => next.lights[0].intensity = value,
